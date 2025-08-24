@@ -333,7 +333,10 @@ fn add_dotter_variable(
 
     // New better way
     dotter.insert("unix".into(), Value::Boolean(cfg!(unix)));
-    dotter.insert("windows".into(), Value::Boolean(cfg!(target_os = "windows")));
+    dotter.insert(
+        "windows".into(),
+        Value::Boolean(cfg!(target_os = "windows")),
+    );
     dotter.insert("linux".into(), Value::Boolean(cfg!(target_os = "linux")));
     dotter.insert("macos".into(), Value::Boolean(cfg!(target_os = "macos")));
 

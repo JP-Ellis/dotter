@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use crossterm::style::Stylize;
 use handlebars::Handlebars;
 
-use crate::config::{SymbolicTarget, TemplateTarget, Variables};
+use crate::config::{CopyTarget, SymbolicTarget, TemplateTarget, Variables};
 use crate::difference::{self, diff_nonempty, generate_template_diff, print_diff};
-use crate::filesystem::{Filesystem, SymlinkComparison, TemplateComparison};
+use crate::filesystem::{CopyComparison, Filesystem, SymlinkComparison, TemplateComparison};
 
 #[cfg_attr(test, mockall::automock)]
 pub trait ActionRunner {
@@ -27,6 +27,9 @@ pub trait ActionRunner {
         cache: &Path,
         target: &TemplateTarget,
     ) -> Result<bool>;
+    fn delete_copy(&mut self, source: &Path, target: &Path) -> Result<bool>;
+    fn create_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool>;
+    fn update_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool>;
 }
 
 pub struct RealActionRunner<'a> {
@@ -100,6 +103,15 @@ impl ActionRunner for RealActionRunner<'_> {
             self.force,
             self.diff_context_lines,
         )
+    }
+    fn delete_copy(&mut self, source: &Path, target: &Path) -> Result<bool> {
+        delete_copy(source, target, self.fs, self.force)
+    }
+    fn create_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool> {
+        create_copy(source, target, self.fs, self.force)
+    }
+    fn update_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool> {
+        update_copy(source, target, self.fs, self.force)
     }
 }
 
@@ -211,6 +223,55 @@ pub fn delete_template(
         TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile => {
             error!(
                 "Deleting template {:?} -> {:?} but {}. Skipping.",
+                source, target, comparison
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Returns true if the copy should be removed from cache.
+pub fn delete_copy(
+    source: &Path,
+    target: &Path,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    info!("{} copy {:?} -> {:?}", "[-]".red(), source, target);
+
+    let comparison = fs
+        .compare_copy(source, target)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        CopyComparison::Identical => {
+            debug!("Performing deletion");
+            fs.remove_file(target).context("remove copy target")?;
+            fs.delete_parents(target, false)
+                .context("delete parents of copy target")?;
+            Ok(true)
+        }
+        CopyComparison::TargetNotPresent | CopyComparison::SourceNotPresent => {
+            warn!(
+                "Deleting copy {:?} -> {:?} but target doesn't exist. Removing from cache anyways.",
+                source, target
+            );
+            Ok(true)
+        }
+        CopyComparison::Changed | CopyComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Deleting copy {:?} -> {:?} but {}. Forcing.",
+                source, target, comparison
+            );
+            fs.remove_file(target).context("remove copy target")?;
+            fs.delete_parents(target, false)
+                .context("delete parents of copy target")?;
+            Ok(true)
+        }
+        CopyComparison::Changed | CopyComparison::TargetNotRegularFile => {
+            error!(
+                "Deleting copy {:?} -> {:?} but {}. Skipping.",
                 source, target, comparison
             );
             Ok(false)
@@ -392,6 +453,82 @@ pub fn create_template(
     }
 }
 
+/// Returns true if the copy should be added to cache.
+pub fn create_copy(
+    source: &Path,
+    target: &CopyTarget,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    info!("{} copy {:?} -> {:?}", "[+]".green(), source, target.target);
+
+    let comparison = fs
+        .compare_copy(source, &target.target)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        CopyComparison::TargetNotPresent => {
+            debug!("Performing creation");
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("copy source to target")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::Identical => {
+            warn!(
+                "Creating copy {:?} -> {:?} but target already exists and matches source. Adding to cache anyways.",
+                source, target.target
+            );
+            Ok(true)
+        }
+        CopyComparison::SourceNotPresent => {
+            error!(
+                "Creating copy {:?} -> {:?} but source is missing. Skipping.",
+                source, target.target
+            );
+            Ok(false)
+        }
+        CopyComparison::Changed | CopyComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Creating copy {:?} -> {:?} but {}. Forcing.",
+                source, target.target, comparison
+            );
+            fs.remove_file(&target.target)
+                .context("remove existing target while forcing")?;
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("copy source to target")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::Changed | CopyComparison::TargetNotRegularFile => {
+            error!(
+                "Creating copy {:?} -> {:?} but {}. Skipping.",
+                source, target.target, comparison
+            );
+            Ok(false)
+        }
+    }
+}
+
 // == UPDATE ==
 
 /// Returns true if the symlink wasn't skipped
@@ -560,6 +697,110 @@ pub fn update_template(
         TemplateComparison::TargetNotRegularFile => {
             error!(
                 "Updating template {:?} -> {:?} but {}. Skipping.",
+                source, target.target, comparison
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Returns true if the copy was not skipped.
+pub fn update_copy(
+    source: &Path,
+    target: &CopyTarget,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    debug!("Updating copy {:?} -> {:?}...", source, target.target);
+
+    let comparison = fs
+        .compare_copy(source, &target.target)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        CopyComparison::Identical => {
+            debug!("Already up to date");
+            fs.set_owner(&target.target, &target.owner)
+                .context("set target file owner")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::TargetNotPresent => {
+            warn!(
+                "Updating copy {:?} -> {:?} but target is missing. Creating it anyways.",
+                source, target.target
+            );
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("copy source to target")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::SourceNotPresent => {
+            error!(
+                "Updating copy {:?} -> {:?} but source is missing. Skipping.",
+                source, target.target
+            );
+            Ok(false)
+        }
+        CopyComparison::Changed => {
+            // Source was updated; the target is stale. Re-copy to sync.
+            info!(
+                "{} copy {:?} -> {:?} (source changed)",
+                "[~]".yellow(),
+                source,
+                target.target
+            );
+            fs.remove_file(&target.target)
+                .context("remove stale copy target")?;
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("copy source to target")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Updating copy {:?} -> {:?} but {}. Forcing.",
+                source, target.target, comparison
+            );
+            fs.remove_file(&target.target)
+                .context("remove target while forcing")?;
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("copy source to target")?;
+            fs.copy_permissions(source, &target.target, &target.owner)
+                .context("copy permissions from source to target")?;
+            Ok(true)
+        }
+        CopyComparison::TargetNotRegularFile => {
+            error!(
+                "Updating copy {:?} -> {:?} but {}. Skipping.",
                 source, target.target, comparison
             );
             Ok(false)

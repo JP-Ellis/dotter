@@ -49,6 +49,9 @@ pub trait Filesystem {
     /// Check state of expected symbolic link on disk
     fn compare_template(&mut self, target: &Path, cache: &Path) -> Result<TemplateComparison>;
 
+    /// Check state of an expected copy on disk (source vs target, byte-for-byte).
+    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison>;
+
     /// Removes a file or folder, elevating privileges if needed
     fn remove_file(&mut self, path: &Path) -> Result<()>;
 
@@ -117,6 +120,10 @@ impl Filesystem for RealFilesystem {
         trace!("Cache state: {:#?}", cache_state);
 
         Ok(compare_template(target_state, cache_state))
+    }
+
+    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
+        compare_copy(source, target)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<()> {
@@ -283,6 +290,10 @@ impl Filesystem for RealFilesystem {
         Ok(compare_template(target_state, cache_state))
     }
 
+    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
+        compare_copy(source, target)
+    }
+
     fn remove_file(&mut self, path: &Path) -> Result<()> {
         let metadata = path.symlink_metadata().context("get metadata")?;
         let result = if metadata.is_dir() {
@@ -422,8 +433,8 @@ impl Filesystem for RealFilesystem {
         use std::io::Write;
 
         if let Some(owner) = owner {
-            let contents = std::fs::read_to_string(source)
-                .context("read source file contents as current user")?;
+            let contents =
+                std::fs::read(source).context("read source file contents as current user")?;
             let mut child = self
                 .sudo(format!(
                     "Copying {source:?} -> {target:?} as user {owner:?}"
@@ -443,7 +454,7 @@ impl Filesystem for RealFilesystem {
                 .stdin
                 .as_ref()
                 .expect("has stdin")
-                .write_all(contents.as_bytes())
+                .write_all(&contents)
                 .context("give input to tee")?;
 
             let success = child.wait().context("wait for sudo tee")?.success();
@@ -595,6 +606,29 @@ impl Filesystem for DryRunFilesystem {
         };
 
         Ok(compare_template(target_state, cache_state))
+    }
+
+    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
+        let source_state = self.get_state(source).context("get source state")?;
+        let target_state = self.get_state(target).context("get target state")?;
+
+        Ok(match (source_state, target_state) {
+            (FileState::Missing, _) => CopyComparison::SourceNotPresent,
+            (_, FileState::Missing) => CopyComparison::TargetNotPresent,
+            (_, FileState::SymbolicLink(_) | FileState::Directory) => {
+                CopyComparison::TargetNotRegularFile
+            }
+            (FileState::File(s), FileState::File(t)) => {
+                if s == t {
+                    CopyComparison::Identical
+                } else {
+                    CopyComparison::Changed
+                }
+            }
+            (FileState::SymbolicLink(_) | FileState::Directory, _) => {
+                CopyComparison::SourceNotPresent
+            }
+        })
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<()> {
@@ -779,6 +813,34 @@ impl std::fmt::Display for TemplateComparison {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CopyComparison {
+    /// Target is a regular file and its content matches source byte-for-byte.
+    Identical,
+    /// Target is a regular file but its content differs from source.
+    Changed,
+    /// Target does not exist.
+    TargetNotPresent,
+    /// Source file does not exist.
+    SourceNotPresent,
+    /// Target exists but is not a regular file (e.g. a symlink or directory).
+    TargetNotRegularFile,
+}
+
+impl std::fmt::Display for CopyComparison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        use self::CopyComparison::*;
+        match self {
+            Identical => "target matches source",
+            Changed => "target differs from source",
+            TargetNotPresent => "target missing",
+            SourceNotPresent => "source is missing",
+            TargetNotRegularFile => "target already exists and isn't a regular file",
+        }
+        .fmt(f)
+    }
+}
+
 fn compare_template(target_state: FileState, cache_state: FileState) -> TemplateComparison {
     match (target_state, cache_state) {
         (FileState::File(t), FileState::File(c)) => {
@@ -793,6 +855,33 @@ fn compare_template(target_state: FileState, cache_state: FileState) -> Template
         (FileState::Missing, FileState::Missing) => TemplateComparison::BothMissing,
         _ => TemplateComparison::TargetNotRegularFile,
     }
+}
+
+fn compare_copy(source: &Path, target: &Path) -> Result<CopyComparison> {
+    let source_state = get_file_state(source).context("get source state")?;
+    let target_state = get_file_state(target).context("get target state")?;
+
+    Ok(match (source_state, target_state) {
+        (FileState::Missing, _) => CopyComparison::SourceNotPresent,
+        (_, FileState::Missing) => CopyComparison::TargetNotPresent,
+        (_, FileState::SymbolicLink(_) | FileState::Directory) => {
+            CopyComparison::TargetNotRegularFile
+        }
+        (FileState::File(_), FileState::File(_)) => {
+            // Re-read as bytes for a true binary comparison
+            let source_bytes = std::fs::read(source).context("read source bytes")?;
+            let target_bytes = std::fs::read(target).context("read target bytes")?;
+            if source_bytes == target_bytes {
+                CopyComparison::Identical
+            } else {
+                CopyComparison::Changed
+            }
+        }
+        (FileState::SymbolicLink(_) | FileState::Directory, _) => {
+            // Source is not a regular file — treat as source not present
+            CopyComparison::SourceNotPresent
+        }
+    })
 }
 
 // === Utility functions ===

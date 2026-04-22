@@ -230,11 +230,11 @@ pub fn undeploy(opt: &Options) -> Result<bool> {
         );
     }
 
-    for (deleted_copy, target) in cache.copies.clone() {
+    for (deleted_copy, entry) in cache.copies.clone() {
         execute_action(
-            actions::delete_copy(&deleted_copy, &target, fs, opt.force),
+            actions::delete_copy(&deleted_copy, &entry, fs, opt.force),
             || cache.copies.remove(&deleted_copy),
-            || format!("delete copy {deleted_copy:?} -> {target:?}"),
+            || format!("delete copy {deleted_copy:?} -> {:?}", entry.target),
             &mut suggest_force,
             &mut error_occurred,
         );
@@ -294,7 +294,7 @@ fn run_deploy<A: ActionRunner>(
     let existing_copies: BTreeSet<(PathBuf, PathBuf)> = cache
         .copies
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (k.clone(), v.target.clone()))
         .collect();
 
     let desired_symlinks: BTreeMap<(PathBuf, PathBuf), _> = desired_symlinks
@@ -340,8 +340,9 @@ fn run_deploy<A: ActionRunner>(
     for (source, target) in
         existing_copies.difference(&desired_copies_keyed.keys().cloned().collect())
     {
+        let cached_entry = cache.copies.get(source).unwrap().clone();
         execute_action(
-            runner.delete_copy(source, target),
+            runner.delete_copy(source, &cached_entry),
             || resulting_cache.copies.remove(source),
             || format!("delete copy {source:?} -> {target:?}"),
             &mut suggest_force,
@@ -402,17 +403,18 @@ fn run_deploy<A: ActionRunner>(
         let target = desired_copies_keyed
             .get(&(source.clone(), target_path.clone()))
             .unwrap();
-        execute_action(
-            runner.create_copy(source, target),
-            || {
-                resulting_cache
-                    .copies
-                    .insert(source.clone(), target_path.clone())
-            },
-            || format!("create copy {source:?} -> {target_path:?}"),
-            &mut suggest_force,
-            &mut error_occurred,
-        );
+        match runner.create_copy(source, target) {
+            Ok(Some(entry)) => {
+                resulting_cache.copies.insert(source.clone(), entry);
+            }
+            Ok(None) => {
+                error_occurred = true;
+            }
+            Err(e) => {
+                error!("Error when trying to create copy {source:?} -> {target_path:?}: {e:?}");
+                error_occurred = true;
+            }
+        }
     }
 
     for (source, target_path) in
@@ -451,13 +453,20 @@ fn run_deploy<A: ActionRunner>(
         let target = desired_copies_keyed
             .get(&(source.clone(), target_path.clone()))
             .unwrap();
-        execute_action(
-            runner.update_copy(source, target),
-            || (),
-            || format!("update copy {source:?} -> {target_path:?}"),
-            &mut suggest_force,
-            &mut error_occurred,
-        );
+        let cached_entry = cache.copies.get(source).unwrap().clone();
+        match runner.update_copy(source, target, &cached_entry) {
+            Ok(Some(entry)) => {
+                resulting_cache.copies.insert(source.clone(), entry);
+            }
+            Ok(None) => {
+                suggest_force = true;
+                error_occurred = true;
+            }
+            Err(e) => {
+                error!("Error when trying to update copy {source:?} -> {target_path:?}: {e:?}");
+                error_occurred = true;
+            }
+        }
     }
 
     *cache = resulting_cache;
@@ -489,7 +498,7 @@ fn execute_action<T, S: FnOnce() -> T, E: FnOnce() -> String>(
 
 #[cfg(test)]
 mod test {
-    use crate::filesystem::{CopyComparison, SymlinkComparison, TemplateComparison};
+    use crate::filesystem::{FileHash, SymlinkComparison, TemplateComparison};
 
     use std::path::{Path, PathBuf};
 
@@ -562,9 +571,14 @@ mod test {
     #[test]
     fn high_level_simple_copy() {
         let c_out: config::CopyTarget = "c_out".into();
-
         let desired_copies = maplit::btreemap! {
             PathBuf::from("c_in") => c_out.clone()
+        };
+
+        let returned_entry = config::CopyEntry {
+            target: PathBuf::from("c_out"),
+            source_checksum: 12345,
+            target_checksum: 12345,
         };
 
         let mut runner = actions::MockActionRunner::new();
@@ -579,7 +593,7 @@ mod test {
                 mockall::predicate::eq(c_out),
             )
             .in_sequence(&mut seq)
-            .returning(|_, _| Ok(true));
+            .returning(move |_, _| Ok(Some(returned_entry.clone())));
 
         let (suggest_force, error_occurred) = run_deploy(
             &mut runner,
@@ -596,8 +610,13 @@ mod test {
 
         assert!(!suggest_force);
         assert!(!error_occurred);
-        assert!(cache.copies.contains_key(&PathBuf::from("c_in")));
-        assert_eq!(cache.copies.len(), 1);
+        let stored = cache
+            .copies
+            .get(&PathBuf::from("c_in"))
+            .expect("should be in cache");
+        assert_eq!(stored.target, PathBuf::from("c_out"));
+        assert_eq!(stored.source_checksum, 12345);
+        assert_eq!(stored.target_checksum, 12345);
     }
 
     #[test]
@@ -989,12 +1008,18 @@ mod test {
         let handlebars = handlebars::Handlebars::new();
         let variables = toml::map::Map::new();
 
-        // delete_copy: target exists and matches source → delete
-        fs.expect_compare_copy()
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 42,
+            target_checksum: 42,
+        };
+
+        // Target hash matches cached → safe to delete
+        fs.expect_checksum_file()
             .times(1)
-            .with(function(path_eq("a_in")), function(path_eq("a_out")))
+            .with(function(path_eq("a_out")))
             .in_sequence(&mut seq)
-            .returning(|_, _| Ok(CopyComparison::Identical));
+            .returning(|_| Ok(crate::filesystem::FileHash::Hash(42)));
         fs.expect_remove_file()
             .times(1)
             .with(function(path_eq("a_out")))
@@ -1013,10 +1038,508 @@ mod test {
             opt.force,
             opt.diff_context_lines,
         );
-        assert!(
-            runner
-                .delete_copy(&PathBuf::from("a_in"), &PathBuf::from("a_out"))
-                .unwrap()
+        assert!(runner.delete_copy(&PathBuf::from("a_in"), &cached).unwrap());
+    }
+
+    #[test]
+    fn low_level_delete_copy_target_missing() {
+        let mut fs = crate::filesystem::MockFilesystem::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 42,
+            target_checksum: 42,
+        };
+
+        // Target missing → warn + return true (remove from cache)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .returning(|_| Ok(FileHash::NotPresent));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
         );
+        assert!(runner.delete_copy(&PathBuf::from("a_in"), &cached).unwrap());
+    }
+
+    #[test]
+    fn low_level_delete_copy_force() {
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options {
+            force: true,
+            ..Options::default()
+        };
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 42,
+            target_checksum: 42,
+        };
+
+        // Target externally modified (hash differs) but --force → delete anyway
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(999)));
+        fs.expect_remove_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(()));
+        fs.expect_delete_parents()
+            .times(1)
+            .with(function(path_eq("a_out")), eq(false))
+            .in_sequence(&mut seq)
+            .returning(|_, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        assert!(runner.delete_copy(&PathBuf::from("a_in"), &cached).unwrap());
+    }
+
+    #[test]
+    fn low_level_create_copy() {
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        // Source exists (hash 100)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target missing → create
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::NotPresent));
+        fs.expect_create_dir_all().times(1).returning(|_, _| Ok(()));
+        fs.expect_copy_file()
+            .times(1)
+            .with(
+                function(path_eq("a_in")),
+                function(path_eq("a_out")),
+                eq(None),
+            )
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+        fs.expect_copy_permissions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .create_copy(&PathBuf::from("a_in"), &copy_target)
+            .unwrap();
+        let entry = result.expect("should have returned a CopyEntry");
+        assert_eq!(entry.target, PathBuf::from("a_out"));
+        assert_eq!(entry.source_checksum, 100);
+        assert_eq!(entry.target_checksum, 100); // same as source since just copied
+    }
+
+    #[test]
+    fn low_level_create_copy_target_matches() {
+        // Target already has same content as source → add to cache without copying
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target hash matches source
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .create_copy(&PathBuf::from("a_in"), &copy_target)
+            .unwrap();
+        let entry = result.expect("should have returned a CopyEntry");
+        assert_eq!(entry.source_checksum, 100);
+        assert_eq!(entry.target_checksum, 100);
+    }
+
+    #[test]
+    fn low_level_create_copy_target_exists_different_no_force() {
+        // Target exists with different content, no --force → skip
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target has different content
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(999)));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .create_copy(&PathBuf::from("a_in"), &copy_target)
+            .unwrap();
+        assert!(result.is_none(), "should have been skipped without --force");
+    }
+
+    #[test]
+    fn low_level_create_copy_target_exists_different_force() {
+        // Target exists with different content, --force → overwrite
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options {
+            force: true,
+            ..Options::default()
+        };
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target has different content
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(999)));
+        // --force: remove existing, re-create
+        fs.expect_remove_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(()));
+        fs.expect_create_dir_all().times(1).returning(|_, _| Ok(()));
+        fs.expect_copy_file()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+        fs.expect_copy_permissions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .create_copy(&PathBuf::from("a_in"), &copy_target)
+            .unwrap();
+        let entry = result.expect("should have returned a CopyEntry");
+        assert_eq!(entry.source_checksum, 100);
+        assert_eq!(entry.target_checksum, 100);
+    }
+
+    #[test]
+    fn update_copy_source_changed() {
+        // Source changed (new hash), target untouched → re-copy
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 100,
+            target_checksum: 100,
+        };
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        // Source has new hash (200)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(200)));
+        // Target still has old hash (100 = cached.target_checksum → unchanged)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // → source changed, target unchanged → re-copy
+        fs.expect_remove_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(()));
+        fs.expect_create_dir_all().times(1).returning(|_, _| Ok(()));
+        fs.expect_copy_file()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+        fs.expect_copy_permissions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .update_copy(&PathBuf::from("a_in"), &copy_target, &cached)
+            .unwrap();
+        let entry = result.expect("should have returned updated entry");
+        assert_eq!(entry.source_checksum, 200);
+        assert_eq!(entry.target_checksum, 200);
+    }
+
+    #[test]
+    fn update_copy_target_externally_modified() {
+        // Source unchanged, target externally edited → back off
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 100,
+            target_checksum: 100,
+        };
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        // Source unchanged (still 100)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target externally modified (now 999)
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(999)));
+        // → source unchanged, target changed → skip
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .update_copy(&PathBuf::from("a_in"), &copy_target, &cached)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn update_copy_identical() {
+        // Nothing changed → set owner/perms, return cached entry
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 100,
+            target_checksum: 100,
+        };
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        // Source unchanged
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target unchanged
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // → nothing changed → set_owner + copy_permissions only
+        fs.expect_set_owner()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Ok(()));
+        fs.expect_copy_permissions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .update_copy(&PathBuf::from("a_in"), &copy_target, &cached)
+            .unwrap();
+        let entry = result.expect("should return entry even when unchanged");
+        assert_eq!(entry.source_checksum, 100);
+        assert_eq!(entry.target_checksum, 100);
+    }
+
+    #[test]
+    fn update_copy_target_missing() {
+        // Target was deleted externally → recreate without calling remove_file
+        let mut fs = crate::filesystem::MockFilesystem::new();
+        let mut seq = mockall::Sequence::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 100,
+            target_checksum: 100,
+        };
+        let copy_target: config::CopyTarget = PathBuf::from("a_out").into();
+
+        // Source unchanged
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_in")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::Hash(100)));
+        // Target is missing
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(FileHash::NotPresent));
+        // No remove_file, target is already gone
+        fs.expect_create_dir_all().times(1).returning(|_, _| Ok(()));
+        fs.expect_copy_file()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+        fs.expect_copy_permissions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(()));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        let result = runner
+            .update_copy(&PathBuf::from("a_in"), &copy_target, &cached)
+            .unwrap();
+        let entry = result.expect("should have returned a recreated CopyEntry");
+        assert_eq!(entry.source_checksum, 100);
+        assert_eq!(entry.target_checksum, 100);
+    }
+
+    #[test]
+    fn low_level_delete_copy_externally_modified() {
+        let mut fs = crate::filesystem::MockFilesystem::new();
+
+        let opt = Options::default();
+        let handlebars = handlebars::Handlebars::new();
+        let variables = toml::map::Map::new();
+
+        let cached = config::CopyEntry {
+            target: PathBuf::from("a_out"),
+            source_checksum: 42,
+            target_checksum: 42,
+        };
+
+        // Target hash does NOT match cached → externally modified, skip
+        fs.expect_checksum_file()
+            .times(1)
+            .with(function(path_eq("a_out")))
+            .returning(|_| Ok(crate::filesystem::FileHash::Hash(999)));
+
+        let mut runner = actions::RealActionRunner::new(
+            &mut fs,
+            &handlebars,
+            &variables,
+            opt.force,
+            opt.diff_context_lines,
+        );
+        assert!(!runner.delete_copy(&PathBuf::from("a_in"), &cached).unwrap());
     }
 }

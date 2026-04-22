@@ -55,6 +55,17 @@ pub struct CopyTarget {
     pub condition: Option<String>,
 }
 
+/// Cached state of a deployed copy: target path plus checksums recorded at deploy time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct CopyEntry {
+    pub target: PathBuf,
+    /// xxh3 hash of the source file at last deploy time.
+    pub source_checksum: u64,
+    /// xxh3 hash of the target file at last deploy time.
+    pub target_checksum: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(from = "FileTargetOuterRepr", into = "FileTargetOuterRepr")]
 pub enum FileTarget {
@@ -224,7 +235,7 @@ pub struct Cache {
     pub symlinks: BTreeMap<PathBuf, PathBuf>,
     pub templates: BTreeMap<PathBuf, PathBuf>,
     #[serde(default)]
-    pub copies: BTreeMap<PathBuf, PathBuf>,
+    pub copies: BTreeMap<PathBuf, CopyEntry>,
 }
 
 pub fn save_dummy_config(

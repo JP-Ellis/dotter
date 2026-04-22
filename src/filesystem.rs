@@ -49,8 +49,9 @@ pub trait Filesystem {
     /// Check state of expected symbolic link on disk
     fn compare_template(&mut self, target: &Path, cache: &Path) -> Result<TemplateComparison>;
 
-    /// Check state of an expected copy on disk (source vs target, byte-for-byte).
-    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison>;
+    /// Compute the xxh3 hash of a file. Returns `NotPresent` if missing, `NotRegularFile`
+    /// if the path is a symlink or directory.
+    fn checksum_file(&mut self, path: &Path) -> Result<FileHash>;
 
     /// Removes a file or folder, elevating privileges if needed
     fn remove_file(&mut self, path: &Path) -> Result<()>;
@@ -122,8 +123,8 @@ impl Filesystem for RealFilesystem {
         Ok(compare_template(target_state, cache_state))
     }
 
-    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
-        compare_copy(source, target)
+    fn checksum_file(&mut self, path: &Path) -> Result<FileHash> {
+        checksum_file(path)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<()> {
@@ -290,8 +291,8 @@ impl Filesystem for RealFilesystem {
         Ok(compare_template(target_state, cache_state))
     }
 
-    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
-        compare_copy(source, target)
+    fn checksum_file(&mut self, path: &Path) -> Result<FileHash> {
+        checksum_file(path)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<()> {
@@ -608,27 +609,18 @@ impl Filesystem for DryRunFilesystem {
         Ok(compare_template(target_state, cache_state))
     }
 
-    fn compare_copy(&mut self, source: &Path, target: &Path) -> Result<CopyComparison> {
-        let source_state = self.get_state(source).context("get source state")?;
-        let target_state = self.get_state(target).context("get target state")?;
-
-        Ok(match (source_state, target_state) {
-            (FileState::Missing, _) => CopyComparison::SourceNotPresent,
-            (_, FileState::Missing) => CopyComparison::TargetNotPresent,
-            (_, FileState::SymbolicLink(_) | FileState::Directory) => {
-                CopyComparison::TargetNotRegularFile
-            }
-            (FileState::File(s), FileState::File(t)) => {
-                if s == t {
-                    CopyComparison::Identical
-                } else {
-                    CopyComparison::Changed
-                }
-            }
-            (FileState::SymbolicLink(_) | FileState::Directory, _) => {
-                CopyComparison::SourceNotPresent
-            }
-        })
+    fn checksum_file(&mut self, path: &Path) -> Result<FileHash> {
+        use xxhash_rust::xxh3::xxh3_64;
+        match self.file_states.get(path) {
+            Some(FileState::Missing) => Ok(FileHash::NotPresent),
+            Some(FileState::SymbolicLink(_) | FileState::Directory) => Ok(FileHash::NotRegularFile),
+            Some(FileState::File(Some(content))) => Ok(FileHash::Hash(xxh3_64(content.as_bytes()))),
+            // Binary content not tracked in dry-run; fall back to real disk.
+            // NOTE: hash reflects pre-deploy on-disk state, not simulated state.
+            Some(FileState::File(None)) => checksum_file(path),
+            // Path not in simulated state; fall back to real filesystem.
+            None => checksum_file(path),
+        }
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<()> {
@@ -813,31 +805,24 @@ impl std::fmt::Display for TemplateComparison {
     }
 }
 
+/// Result of hashing a file on disk.
 #[derive(Debug, PartialEq, Eq)]
-pub enum CopyComparison {
-    /// Target is a regular file and its content matches source byte-for-byte.
-    Identical,
-    /// Target is a regular file but its content differs from source.
-    Changed,
-    /// Target does not exist.
-    TargetNotPresent,
-    /// Source file does not exist.
-    SourceNotPresent,
-    /// Target exists but is not a regular file (e.g. a symlink or directory).
-    TargetNotRegularFile,
+pub enum FileHash {
+    /// File does not exist.
+    NotPresent,
+    /// Path exists but is not a regular file (symlink, directory, etc.).
+    NotRegularFile,
+    /// xxh3 hash of the file's contents.
+    Hash(u64),
 }
 
-impl std::fmt::Display for CopyComparison {
+impl std::fmt::Display for FileHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        use self::CopyComparison::*;
         match self {
-            Identical => "target matches source",
-            Changed => "target differs from source",
-            TargetNotPresent => "target missing",
-            SourceNotPresent => "source is missing",
-            TargetNotRegularFile => "target already exists and isn't a regular file",
+            FileHash::NotPresent => "not present".fmt(f),
+            FileHash::NotRegularFile => "not a regular file".fmt(f),
+            FileHash::Hash(h) => write!(f, "hash({h:#018x})"),
         }
-        .fmt(f)
     }
 }
 
@@ -857,31 +842,16 @@ fn compare_template(target_state: FileState, cache_state: FileState) -> Template
     }
 }
 
-fn compare_copy(source: &Path, target: &Path) -> Result<CopyComparison> {
-    let source_state = get_file_state(source).context("get source state")?;
-    let target_state = get_file_state(target).context("get target state")?;
-
-    Ok(match (source_state, target_state) {
-        (FileState::Missing, _) => CopyComparison::SourceNotPresent,
-        (_, FileState::Missing) => CopyComparison::TargetNotPresent,
-        (_, FileState::SymbolicLink(_) | FileState::Directory) => {
-            CopyComparison::TargetNotRegularFile
-        }
-        (FileState::File(_), FileState::File(_)) => {
-            // Re-read as bytes for a true binary comparison
-            let source_bytes = std::fs::read(source).context("read source bytes")?;
-            let target_bytes = std::fs::read(target).context("read target bytes")?;
-            if source_bytes == target_bytes {
-                CopyComparison::Identical
-            } else {
-                CopyComparison::Changed
-            }
-        }
-        (FileState::SymbolicLink(_) | FileState::Directory, _) => {
-            // Source is not a regular file — treat as source not present
-            CopyComparison::SourceNotPresent
-        }
-    })
+pub(crate) fn checksum_file(path: &Path) -> Result<FileHash> {
+    use xxhash_rust::xxh3::xxh3_64;
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(FileHash::NotPresent),
+        Err(e) => return Err(e).context("stat file for checksum"),
+        Ok(m) if !m.is_file() => return Ok(FileHash::NotRegularFile),
+        Ok(_) => {}
+    }
+    let bytes = std::fs::read(path).context("read file for checksum")?;
+    Ok(FileHash::Hash(xxh3_64(&bytes)))
 }
 
 // === Utility functions ===
